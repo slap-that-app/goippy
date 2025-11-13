@@ -1,0 +1,17 @@
+[Unit]
+Description=goippy UDP/XMPP bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/goippy /etc/goippy.conf
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=3
+User=root
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
