@@ -28,7 +28,7 @@ All configuration and history are stored in MariaDB/MySQL or SQLite.
   `RECORD:ts;id:...;dir:1;num:+123;cause:ANSWER`
    - Saved into `goippy_calls`
    - Each record linked to extension and MSISDN
-
+- GSM phone number must be seted in goip sim setup
 ### XMPP → goippy → GoIP
 A user at XMPP:
 
@@ -93,7 +93,7 @@ Config file: `/etc/goippy.conf`
 Example:
 
 ```python
-DB_BACKEND = 'mariadb'
+DB_BACKEND = 'mysql'
 
 DB_HOST = '127.0.0.1'
 DB_USER = 'goippy'
@@ -119,10 +119,11 @@ LOG_TO_STDOUT = True
 goippy --sample                 # create /etc/goippy.conf
 goippy --install [postfix]      # install + start systemd service
 goippy --uninstall [postfix]    # remove service
+goippy --list                   # list services
 
 goippy --add <ext> <pass> [re]  # create gateway
 goippy --remove <ext>           # delete
-goippy --list                   # list gateways
+goippy --listExt                # list gateways
 ```
 
 Example:
@@ -189,6 +190,8 @@ Now users can send SMS by chatting to:
 
 ## USSD Through XMPP
 
+Work by contact with phone number of used gateway chanel
+
 User sends:
 
 ```
@@ -245,7 +248,7 @@ Outgoing SMS uses ACL (`allow_regex`) if you want to restrict destinations.
 - XMPP component uses a shared secret.
 - All passwords stored in DB.
 - Gateways can be enabled/disabled without touching GoIP.
-- SQLite supported for labs; MariaDB recommended for production.
+- SQLite supported; MariaDB recommended for production.
 
 ---
 
