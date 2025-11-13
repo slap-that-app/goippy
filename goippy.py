@@ -429,6 +429,12 @@ VALUES(?,?,?,?,?,?,?,?)
             )
             self.conn.commit()
 
+    def auth_ok(self, goip_id, goip_pass):
+        c = self.cursor()
+        q = "SELECT 1 FROM goippy_gateways WHERE goip_id=? AND goip_pass=? AND enabled=1" if self.backend=="sqlite" \
+            else "SELECT 1 FROM goippy_gateways WHERE goip_id=%s AND goip_pass=%s AND enabled=1"
+        c.execute(q, (goip_id, goip_pass))
+        return c.fetchone is not None
 
 # -------------------------------------------------------------------
 # GoIP UDP server
@@ -664,11 +670,18 @@ class GoIPServer(threading.Thread):
                         self.log("Malformed req (no id):", msg)
                         continue
 
+                    if not self.db.auth_ok(goip_id, goip_pass):
+                        reply = f"reg:{reqid};status:403;"
+                        self.transport.sendto(reply.encode(), addr)
+                        log(self.c, f"[GoIP] Heartbeat DENY -> {reply}")
+                        continue
+
                     # remember source address
                     self.last_addr_for[goip_id] = addr
 
                     # Always ACK to keep hardware happy
-                    reply = f"resp:{reqid};id:{goip_id};status:0;"
+                    #reply = f"resp:{reqid};id:{goip_id};status:0;"
+                    reply = f"reg:{reqid};status:200;"
                     self.sock.sendto(reply.encode("utf-8"), addr)
                     self.log(f"Heartbeat ACK -> {reply}")
 
@@ -711,26 +724,46 @@ class GoIPServer(threading.Thread):
                     self._deliver_sms_to_xmpp(goip_id, srcnum, text)
                     continue
 
-                # -----------------------------
+                # --------------------------------------------------
                 # USSD replies
-                # e.g. USSD 1234 <text...> or USSN:<ts>;id:...;msg:...
-                # -----------------------------
+                # --------------------------------------------------
                 if msg.startswith("USSN:") or msg.startswith("USSD:"):
-                    # Two styles exist. We'll handle both:
-                    #  1) USSN:ts;id:goip_...;msg:...
-                    #  2) USSD <id> <text...> (we treat as a simple log)
+                    # Format A: USSN:ts;id:goippy_2508;msg:Text
                     if msg[4] == ":":
                         kv = self._parse_kv(msg)
                         goip_id = kv.get("id")
                         text = kv.get("msg") or ""
-                    else:
-                        parts = msg.split(" ", 2)
-                        goip_id = None
-                        text = parts[2] if len(parts) >= 3 else msg
+                        self.log(f"USSD (kv) from {goip_id}: {text!r}")
+                        if goip_id:
+                            self._deliver_ussd_to_xmpp(goip_id, text)
+                        continue
 
-                    self.log(f"USSD reply from {goip_id or '?'}: {text!r}")
+                # --------------------------------------------------
+                # Format B: "USSD <stamp> <text...>"
+                # e.g. "USSD 1763001996 Your balance is..."
+                # --------------------------------------------------
+                if msg.startswith("USSD "):
+                    parts = msg.split(" ", 2)
+                    if len(parts) >= 3:
+                        # parts[0] == "USSD"
+                        # parts[1] == <stamp>
+                        text = parts[2]
+                    else:
+                        text = msg[5:]
+
+                    # Need to detect which GoIP channel this came from
+                    # We use reverse lookup by source IP:port -> goip_id
+                    goip_id = None
+                    for gid, a in self.last_addr_for.items():
+                        if a == addr:
+                            goip_id = gid
+                            break
+
+                    self.log(f"USSD (raw) from {goip_id}: {text!r}")
                     if goip_id:
                         self._deliver_ussd_to_xmpp(goip_id, text)
+                    else:
+                        self.log("Could not resolve goip_id for raw USSD")
                     continue
 
                 # -----------------------------
@@ -801,6 +834,29 @@ class GoIPServer(threading.Thread):
 
         self.log("UDP listener exiting.")
 
+    def _handle_req(self, msg, addr):
+        # req:<id>;id:<goip_id>;pass:<pass>;num:<msisdn>;...;SMS_LOGIN:[Y|N];
+        m = re.search(r"req:(\d+);id:([^;]+);pass:([^;]+);", msg)
+        if not m:
+            log(self.c, "[GoIP] Malformed 'req:'")
+            return
+        reqid, goip_id, goip_pass = m.groups()
+
+        if not self.db.auth_ok(goip_id, goip_pass):
+            reply = f"reg:{reqid};status:403;"
+            self.transport.sendto(reply.encode(), addr)
+            log(self.c, f"[GoIP] Heartbeat DENY -> {reply}")
+            return
+
+        # Store msisdn & last addr
+        num = self._kv(msg).get("num") or ""
+        if num:
+            self.db.update_msisdn(goip_id, num)
+        self.last_addr[goip_id] = addr
+
+        reply = f"reg:{reqid};status:200;"
+        self.transport.sendto(reply.encode(), addr)
+        log(self.c, f"[GoIP] Heartbeat ACK -> {reply}")
 
 # -------------------------------------------------------------------
 # XMPP Component
@@ -904,7 +960,6 @@ class GoippyXMPP(ComponentXMPP):
                 mbody=f"Error: {e}",
                 mtype="chat",
             )
-
 
 # -------------------------------------------------------------------
 # Systemd unit writer
@@ -1132,19 +1187,19 @@ def run_daemon(conf_path):
     db.connect()
     db.ensure_tables()
 
-    # XMPP is created first, GoIPServer uses it.
-    # XMPP->GoIP: XMPP component has goip_server injected.
-    # GoIP->XMPP: GoIPServer calls xmpp.send_message via loop.call_soon_threadsafe.
-
-    # We'll create GoIPServer without xmpp first, then make xmpp, then link them.
+    # Create GoIP server first (without XMPP)
     goip_server = GoIPServer(c, db, xmpp=None)
+
+    # Create XMPP component
     xmpp = GoippyXMPP(c, db, goip_server)
+
+    # Link them
     goip_server.xmpp = xmpp
 
     # Start UDP listener thread
     goip_server.start()
 
-    # Handle shutdown
+    # Flag for graceful shutdown
     stop_flag = {"stopping": False}
 
     def shutdown(signum, frame):
@@ -1152,32 +1207,53 @@ def run_daemon(conf_path):
             return
         stop_flag["stopping"] = True
         print(f"[goippy] Caught signal {signum}, shutting down...")
+
         try:
             goip_server.stop()
-        except Exception:
+        except:
+            pass
+
+        try:
+            xmpp.disconnect()
+        except:
+            pass
+
+        try:
+            loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(loop.stop)
+        except:
+            pass
+
+    # Register signal handlers
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    # ----------------------------------------------------
+    # XMPP CONNECT + MAIN LOOP (this keeps daemon alive)
+    # ----------------------------------------------------
+    loop = asyncio.get_event_loop()
+
+    # Connect component to XMPP server
+    loop.run_until_complete(xmpp.connect())
+
+    # Wait for session_start
+    loop.create_task(xmpp.wait_until('session_start'))
+
+    # Block here until shutdown()
+    try:
+        loop.run_forever()
+    finally:
+        # safety cleanup
+        try:
+            goip_server.stop()
+        except:
             pass
         try:
             xmpp.disconnect()
-        except Exception:
+        except:
             pass
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            signal.signal(sig, shutdown)
-        except Exception:
-            pass
-
-    # Run XMPP event loop
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_until_complete(xmpp.connect())
-        loop.create_task(xmpp.wait_until("session_start"))
-        loop.run_forever()
-    finally:
-        try:
-            goip_server.stop()
-        except Exception:
-            pass
+        print("[goippy] daemon stopped.")
 
 
 # -------------------------------------------------------------------
