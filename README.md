@@ -1,51 +1,256 @@
 # goippy
+UDP-only GoIP ↔ XMPP bridge for SMS, USSD and call logging
 
-UDP-only **GoIP ↔ XMPP** bridge for SMS, USSD and call logging.
+goippy communicates with GoIP devices using their SMS-Server UDP API  
+(`req:…`, `RECEIVE:…`, `USSD …`, `RECORD:…`, `HANGUP:…`)  
+and exposes SMS/USSD to XMPP through an external component (Prosody, ejabberd).
 
-- Talks to GoIP via its **SMS Server UDP API** (`req:`, `RECEIVE:`, `USSD`, `RECORD:`, `HANGUP:`…)
-- Talks to XMPP using an **external component** (Prosody, ejabberd, etc.).
-- Stores configuration and history in **MariaDB/MySQL** or **SQLite**.
+All configuration and history are stored in MariaDB/MySQL or SQLite.
 
 ---
 
-## Flow
+## Features
 
-### 1. GoIP → goippy
+### GoIP → goippy → XMPP
+- Heartbeats (`req:nnn;id:...;pass:...`)
+   - Validated against database
+   - goippy replies: `reg:<id>;status:200;`
+   - MSISDN stored per gateway
+- Incoming SMS:  
+  `RECEIVE:ts;id:goippy_2001;srcnum:+123;msg:Hello`
+   - ACK: `RECEIVEOK:ts;id:goippy_2001;status:0;`
+   - Logged and forwarded to XMPP as:  
+     from: `+123@data.example.org` → to: `2001@example.org`
+- Incoming USSD:
+  `USSD <stamp> <text…>`
+   - Logged and delivered to XMPP as a `[USSD]` message
+- Call records:
+  `RECORD:ts;id:...;dir:1;num:+123;cause:ANSWER`
+   - Saved into `goippy_calls`
+   - Each record linked to extension and MSISDN
 
-GoIP is configured with:
+### XMPP → goippy → GoIP
+A user at XMPP:
 
-- SMS server IP: your goippy host
-- SMS server port: `GOIP_PORT` (default `44444`)
-- ID for SMS server: `goippy_<ext>` (e.g. `goippy_2001`)
-- Password: same `goip_pass` you configure in DB.
+```
+2001@example.org
+```
 
-GoIP sends:
+sends a chat to a phone JID:
 
-- `req:nnn;id:goippy_2001;pass:...;num:+123456789;...` – keepalive  
-  → goippy replies `resp:nnn;id:goippy_2001;status:0;` and stores MSISDN.
+```
++123456789@example.org
+```
 
-- `RECEIVE:ts;id:goippy_2001;password:...;srcnum:+123456789;msg:Hello`  
-  → goippy ACKs with `RECEIVEOK:ts;id:goippy_2001;status:0;`  
-  → logs into DB and forwards to XMPP as:
+or (with the alias module) simply:
 
-    - from: `+123456789@data.example.org`
-    - to:   `2001@example.org`
+```
++123456789
+```
 
-- `USSN:ts;id:goippy_2001;msg:Your balance is...`  
-  → delivered as `[USSD] Your balance is...` to `2001@example.org`.
+goippy looks up the bound gateway (`goippy_2001`), and sends via UDP:
 
-- `RECORD:` / `HANGUP:`  
-  → written into `goippy_calls` with ext, remote number, direction, cause.
+```
+SMS <stamp> 1 <goip_pass> +123456789 <text>
+```
 
-### 2. XMPP → goippy → GoIP
+USSD is sent using:
 
-XMPP clients connect to `example.org`.  
-Your goippy component is `sms.example.org` in Prosody/ejabberd.
+```
+USSD <stamp> <goip_pass> *100#
+```
 
-User `2001@example.org`:
+Delivery reports (`DELIVER:`) are stored in `goippy_log`.
 
-- sends chat to `+123456789@example.org` with body `hello`  
-  → goippy finds gateway `ext=2001`, uses last GoIP address and sends:
+---
 
-  ```text
-  SMS <stamp> 1 <goip_pass> +123456789 hello
+## Database Schema
+
+Tables automatically created:
+
+### goippy_gateways
+- ext
+- goip_id (`goippy_<ext>`)
+- goip_pass
+- channel
+- msisdn
+- allow_regex (ACL for outgoing SMS)
+- enabled
+
+### goippy_calls
+Full call history:  
+time, goip_id, ext, direction, remote_num, cause, msisdn, raw line.
+
+### goippy_log
+Traffic log (incoming/outgoing SMS, USSD, delivery reports).
+
+---
+
+## Configuration
+
+Config file: `/etc/goippy.conf`
+
+Example:
+
+```python
+DB_BACKEND = 'mariadb'
+
+DB_HOST = '127.0.0.1'
+DB_USER = 'goippy'
+DB_PASS = 'pass_goippy'
+DB_NAME = 'messaging'
+DB_PORT = 3306
+
+# SQLite alternative:
+# DB_BACKEND = 'sqlite'
+# SQLITE_PATH = '/var/lib/goippy/goippy.sqlite3'
+
+GOIP_UDP_BIND = '0.0.0.0'
+GOIP_UDP_PORT = 44444
+
+LOG_TO_STDOUT = True
+```
+
+---
+
+## Admin CLI
+
+```
+goippy --sample                 # create /etc/goippy.conf
+goippy --install [postfix]      # install + start systemd service
+goippy --uninstall [postfix]    # remove service
+
+goippy --add <ext> <pass> [re]  # create gateway
+goippy --remove <ext>           # delete
+goippy --list                   # list gateways
+```
+
+Example:
+
+```
+goippy --add 2001 secret123
+goippy --add 2508 abc123 ^\+37255
+```
+
+This creates:
+
+```
+goip_id = goippy_2001
+goip_pass = secret123
+```
+
+Set the same ID/pass in the GoIP SMS Server config.
+
+---
+
+## GoIP Configuration
+
+In GoIP web UI:
+
+```
+SMS Server IP:     <your server>
+SMS Server Port:   44444
+ID for SMS:        goippy_<ext>
+Password:          <goip_pass>
+```
+
+Nothing else required — no SMPP, no HTTP.
+
+---
+
+## Prosody XMPP Setup
+
+goippy connects as an XMPP component, example:
+
+```
+Component "data.example.org"
+    component_secret = "YOUR_SECRET"
+```
+
+### Optional helper module: mod_sms_alias
+
+Simplifies sending messages to phone numbers.
+
+Put this file into `/usr/lib/prosody/modules/mod_sms_alias.lua`:
+
+Enable in the virtual host:
+
+```lua
+modules_enabled = { "sms_alias" }
+```
+
+Now users can send SMS by chatting to:
+
+```
++123456789
+```
+
+---
+
+## USSD Through XMPP
+
+User sends:
+
+```
+*100#
+```
+
+to:
+
+```
++123@example.org
+```
+
+goippy converts to GoIP UDP:
+
+```
+USSD <stamp> <goip_pass> *100#
+```
+
+GoIP replies:
+
+```
+USSD <stamp> <text>
+```
+
+goippy forwards to XMPP as a private message:
+
+```
+[USSD] <text>
+```
+
+---
+
+## Multiple GoIP devices / many channels
+
+Each GoIP channel identifies itself with its **ID** and **pass**:
+
+```
+goippy_2001 / secret
+goippy_2002 / secret2
+...
+```
+
+Any number of devices can be mixed, even across subnets.
+
+The MSISDN of each gateway is automatically updated from GoIP’s `num:` field.
+
+Outgoing SMS uses ACL (`allow_regex`) if you want to restrict destinations.
+
+---
+
+## Security
+
+- UDP API access must be firewalled (GoIP → server only).
+- XMPP component uses a shared secret.
+- All passwords stored in DB.
+- Gateways can be enabled/disabled without touching GoIP.
+- SQLite supported for labs; MariaDB recommended for production.
+
+---
+
+## License
+
+MIT.  
+Generated with assistance from ChatGPT and refined manually.
+
