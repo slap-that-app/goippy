@@ -13,6 +13,7 @@ All configuration and history are stored in MariaDB/MySQL or SQLite.
   - goip1
   - Firmware Version:	GHSFVT-1.1-68-9
   - Module Version:	M25MAR01A01_RSIM
+  - GSM phone number must be seted in goip sim setup
 ---
 
 ## Features
@@ -107,7 +108,7 @@ Example:
 XMPP_DOMAIN = "example.org"
 
 # Domain used as 'from' for inbound SMS / USSD events
-XMPP_DATA_DOMAIN = "data.example.org"
+XMPP_DATA_DOMAIN = "sms.example.org"
 
 # Component identity (external component in Prosody / ejabberd)
 XMPP_COMPONENT_JID = "sms.example.org"

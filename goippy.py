@@ -82,7 +82,7 @@ SAMPLE_TEXT = r"""# =============================================
 XMPP_DOMAIN = "example.org"
 
 # Domain used as 'from' for inbound SMS / USSD events
-XMPP_DATA_DOMAIN = "data.example.org"
+XMPP_DATA_DOMAIN = "sms.example.org"
 
 # Component identity (external component in Prosody / ejabberd)
 XMPP_COMPONENT_JID = "sms.example.org"
