@@ -135,6 +135,7 @@ def load_conf(path):
     ns.setdefault("GOIP_BIND", "0.0.0.0")
     ns.setdefault("GOIP_PORT", 44444)
     ns.setdefault("DB_BACKEND", "mysql")
+    ns.setdefault("LOG_DAYS", 0)
     return ns
 
 
@@ -435,6 +436,27 @@ VALUES(?,?,?,?,?,?,?,?)
             else "SELECT 1 FROM goippy_gateways WHERE goip_id=%s AND goip_pass=%s AND enabled=1"
         c.execute(q, (goip_id, goip_pass))
         return c.fetchone is not None
+
+    def purge_old_logs(self, days):
+        """Delete logs older than <days> days. days=0 → do nothing."""
+        if not days or days <= 0:
+            return
+
+        self.connect()
+
+        if self.kind == "sqlite":
+            sql = """
+                DELETE FROM goippy_log
+                WHERE created_at < datetime('now', ?)
+            """
+            # Example: days=3 → '-3 days'
+            self._exec(sql, (f"-{days} days",))
+        else:
+            sql = """
+                DELETE FROM goippy_log
+                WHERE created_at < (NOW() - INTERVAL %s DAY)
+            """
+            self._exec(sql, (days,))
 
 # -------------------------------------------------------------------
 # GoIP UDP server
@@ -1175,6 +1197,22 @@ def cli_ussd(args):
         "The running goippy daemon will convert that to UDP USSD."
     )
 
+def start_log_purger(conf, db):
+    days = int(conf.get("LOG_DAYS", 0))
+    if days <= 0:
+        return  # Disabled
+
+    def worker():
+        while True:
+            try:
+                db.purge_old_logs(days)
+            except Exception as e:
+                print("[goippy] Log purge error:", e)
+            time.sleep(3600)  # run every hour
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return t
 
 # -------------------------------------------------------------------
 # Daemon main runner
@@ -1198,6 +1236,9 @@ def run_daemon(conf_path):
 
     # Start UDP listener thread
     goip_server.start()
+
+    # NEW: start log cleanup worker
+    start_log_purger(c, db)
 
     # Flag for graceful shutdown
     stop_flag = {"stopping": False}

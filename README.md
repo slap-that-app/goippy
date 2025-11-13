@@ -7,6 +7,12 @@ and exposes SMS/USSD to XMPP through an external component (Prosody, ejabberd).
 
 All configuration and history are stored in MariaDB/MySQL or SQLite.
 
+
+---
+  Tested on: 
+  - goip1
+  - Firmware Version:	GHSFVT-1.1-68-9
+  - Module Version:	M25MAR01A01_RSIM
 ---
 
 ## Features
