@@ -93,22 +93,50 @@ Config file: `/etc/goippy.conf`
 Example:
 
 ```python
-DB_BACKEND = 'mysql'
 
-DB_HOST = '127.0.0.1'
-DB_USER = 'goippy'
-DB_PASS = 'pass_goippy'
-DB_NAME = 'messaging'
-DB_PORT = 3306
+# -----------------------------
+# XMPP
+# -----------------------------
+# Main domain where user extensions live
+XMPP_DOMAIN = "example.org"
 
-# SQLite alternative:
-# DB_BACKEND = 'sqlite'
-# SQLITE_PATH = '/var/lib/goippy/goippy.sqlite3'
+# Domain used as 'from' for inbound SMS / USSD events
+XMPP_DATA_DOMAIN = "data.example.org"
 
-GOIP_UDP_BIND = '0.0.0.0'
-GOIP_UDP_PORT = 44444
+# Component identity (external component in Prosody / ejabberd)
+XMPP_COMPONENT_JID = "sms.example.org"
+XMPP_COMPONENT_SECRET = "replace_me"
 
-LOG_TO_STDOUT = True
+# Fallback delivery target when MSISDN has no mapping
+XMPP_FALLBACK_DEST = "0000@example.org"
+
+# XMPP host/port where component connects
+XMPP_HOST = "127.0.0.1"
+XMPP_PORT = 5347
+
+
+# -----------------------------
+# GoIP UDP listener
+# -----------------------------
+# IP/port where GoIP "SMS Server" points
+GOIP_BIND = "0.0.0.0"
+GOIP_PORT = 44444
+
+
+# -----------------------------
+# Database backend
+# -----------------------------
+# DB_BACKEND: "mysql" or "sqlite"
+DB_BACKEND = "mysql"
+
+# For MySQL/MariaDB:
+DB_HOST = "localhost"
+DB_BASE = "goippy"
+DB_USER = "goippy"
+DB_PASS = "replace_me"
+
+# For SQLite (experimental):
+DB_FILE = "/var/lib/goippy/goippy.db"
 ```
 
 ---
@@ -130,7 +158,7 @@ Example:
 
 ```
 goippy --add 2001 secret123
-goippy --add 2508 abc123 ^\+37255
+goippy --add 2508 abc123 ^\+12345
 ```
 
 This creates:
@@ -192,7 +220,7 @@ Now users can send SMS by chatting to:
 
 Work by contact with phone number of used gateway chanel
 
-User sends:
+User from contact with gsm phone number of goip channel sends:
 
 ```
 *100#
