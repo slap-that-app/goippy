@@ -1,263 +1,254 @@
-# goippy
-UDP-only GoIP ↔ XMPP bridge for SMS, USSD and call logging
+# goippy – GoIP UDP ↔ XMPP SMS/USSD Bridge
 
-goippy communicates with GoIP devices using their SMS-Server UDP API  
-(`req:…`, `RECEIVE:…`, `USSD …`, `RECORD:…`, `HANGUP:…`)  
-and exposes SMS/USSD to XMPP through an external component (Prosody, ejabberd).
+`goippy` is a lightweight UDP-only integration bridge between **GoIP GSM gateways** and **XMPP** using an external component.
 
-Use MariaDB/MySQL or SQLite.
-
-
----
-  Tested on: 
-  - goip1
-  - Firmware Version:	GHSFVT-1.1-68-9
-  - Module Version:	M25MAR01A01_RSIM
-  - GSM phone number must be seted in goip sim setup
----
+It provides SMS, USSD, call logging, real-time GoIP state monitoring, bot commands, automatic log cleanup, watchdog reconnection, and multi-instance support.
 
 ## Features
 
-### GoIP → goippy → XMPP
-- Heartbeats (`req:nnn;id:...;pass:...`)
-   - Validated against database
-   - goippy replies: `reg:<id>;status:200;`
-   - MSISDN stored per gateway
-- Incoming SMS:  
-  `RECEIVE:ts;id:goippy_2001;srcnum:+123;msg:Hello`
-   - ACK: `RECEIVEOK:ts;id:goippy_2001;status:0;`
-   - Logged and forwarded to XMPP as:  
-     from: `+123@data.example.org` → to: `2001@example.org`
-- Incoming USSD:
-  `USSD <stamp> <text…>`
-   - Logged and delivered to XMPP as a `[USSD]` message
-- Call records:
-  `RECORD:ts;id:...;dir:1;num:+123;cause:ANSWER`
-   - Saved into `goippy_calls`
-   - Each record linked to extension and MSISDN
-- GSM phone number must be seted in goip sim setup
-### XMPP → goippy → GoIP
-A user at XMPP:
+- Inbound SMS → XMPP chat messages
+- Outbound SMS from XMPP → GoIP via UDP
+- Outbound USSD via XMPP
+- Inbound USSD replies → XMPP
+- Full parsing of GoIP `req:` state packets into DB
+- BOT commands (`status`, `log`, `log N`)
+- Automatic hourly log cleanup (`LOG_DAYS`)
+- XMPP watchdog reconnect
+- Multi-instance systemd support
+- MySQL/MariaDB + SQLite (experimental)
+- Prosody routing via `mod_sms_alias`
 
-```
-2001@example.org
-```
 
-sends a chat to a phone JID:
+## Installation
 
-```
-+123456789@example.org
-```
+### Create sample config
+goippy --sample
 
-or (with the alias module) simply:
+### Install systemd service
+goippy --install
 
-```
-+123456789
-```
+### Install instance per extension
+goippy --install 2508
 
-goippy looks up the bound gateway (`goippy_2001`), and sends via UDP:
+### List installed instances
+goippy --list
 
-```
-SMS <stamp> 1 <goip_pass> +123456789 <text>
-```
+### Uninstall instance
+goippy --uninstall 2508
 
-USSD is sent using:
+## Configuration (/etc/goippy.conf)
 
-```
-USSD <stamp> <goip_pass> *100#
-```
+XMPP_DOMAIN            = "example.org"
+XMPP_DATA_DOMAIN       = "sms.example.org"
 
-Delivery reports (`DELIVER:`) are stored in `goippy_log`.
+XMPP_COMPONENT_JID     = "sms.example.org"
+XMPP_COMPONENT_SECRET  = "replace_me"
+XMPP_HOST              = "127.0.0.1"
+XMPP_PORT              = 5347
 
----
+GOIP_BIND              = "0.0.0.0"
+GOIP_PORT              = 44444
+
+DB_BACKEND             = "mysql"
+DB_HOST                = "localhost"
+DB_BASE                = "goippy"
+DB_USER                = "goippy"
+DB_PASS                = "secret"
+
+LOG_DAYS               = 3
+
+## Prosody Integration
+
+### External component
+Component "sms.example.org" "component"
+component_secret = "replace_me"
+
+### Enable sms aliasing
+modules_enabled = {
+"sms_alias";
+}
+
+### Rewriting performed
++372xxxxxxx@example.org  →  +372xxxxxxx@sms.example.org
 
 ## Database Schema
 
-Tables automatically created:
-
 ### goippy_gateways
-- ext
-- goip_id (`goippy_<ext>`)
-- goip_pass
-- channel
-- msisdn
-- allow_regex (ACL for outgoing SMS)
-- enabled
+Maps extensions to GoIP credentials and msisdn.
+
+### goippy_state
+Stores parsed GoIP keepalive fields:  
+msisdn, signal, gsm_status, voip_status, voip_state, remain_time, provider, disable_status, updated_at.
 
 ### goippy_calls
-Full call history:  
-time, goip_id, ext, direction, remote_num, cause, msisdn, raw line.
+Stores RECORD: and HANGUP: events.
 
 ### goippy_log
-Traffic log (incoming/outgoing SMS, USSD, delivery reports).
+Stores inbound & outbound SMS/USSD logs.
 
----
+## Database Schema
 
-## Configuration
+### goippy_gateways
+Maps extensions to GoIP credentials and msisdn.
 
-Config file: `/etc/goippy.conf`
+### goippy_state
+Stores parsed GoIP keepalive fields:  
+msisdn, signal, gsm_status, voip_status, voip_state, remain_time, provider, disable_status, updated_at.
 
-Example:
+### goippy_calls
+Stores RECORD: and HANGUP: events.
 
-```python
+### goippy_log
+Stores inbound & outbound SMS/USSD logs.
 
-# -----------------------------
-# XMPP
-# -----------------------------
-# Main domain where user extensions live
-XMPP_DOMAIN = "example.org"
+## BOT Commands (chatting with own MSISDN)
 
-# Domain used as 'from' for inbound SMS / USSD events
-XMPP_DATA_DOMAIN = "sms.example.org"
+When chatting with the extension's **own SIM number**, the message is interpreted as a bot command.
 
-# Component identity (external component in Prosody / ejabberd)
-XMPP_COMPONENT_JID = "sms.example.org"
-XMPP_COMPONENT_SECRET = "replace_me"
+### status
+Shows last known GoIP state.
 
-# Fallback delivery target when MSISDN has no mapping
-XMPP_FALLBACK_DEST = "0000@example.org"
+### log
+Shows all recent call entries.
 
-# XMPP host/port where component connects
-XMPP_HOST = "127.0.0.1"
-XMPP_PORT = 5347
+### log N
+Shows last N call entries.
 
+### anything else
+Is sent to GoIP as USSD.
 
-# -----------------------------
-# GoIP UDP listener
-# -----------------------------
-# IP/port where GoIP "SMS Server" points
-GOIP_BIND = "0.0.0.0"
-GOIP_PORT = 44444
-
-
-# -----------------------------
-# Database backend
-# -----------------------------
-# DB_BACKEND: "mysql" or "sqlite"
-DB_BACKEND = "mysql"
-
-# For MySQL/MariaDB:
-DB_HOST = "localhost"
-DB_BASE = "goippy"
-DB_USER = "goippy"
-DB_PASS = "replace_me"
-
-# For SQLite (experimental):
-DB_FILE = "/var/lib/goippy/goippy.db"
-```
-
----
-
-## Admin CLI
-
-```
-goippy --sample                 # create /etc/goippy.conf
-goippy --install [postfix]      # install + start systemd service
-goippy --uninstall [postfix]    # remove service
-goippy --list                   # list services
-
-goippy --add <ext> <pass> [re]  # create gateway
-goippy --remove <ext>           # delete
-goippy --listExt                # list gateways
-```
+## GoIP Keepalive Parsing
 
 Example:
+req:1102;id:goippy_2508;pass:...;num:+37255620268;signal:25;
+gsm_status:LOGIN;voip_status:LOGIN;voip_state:IDLE;remain_time:-1;
+pro:Tele2;disable_status:0;...
 
-```
-goippy --add 2001 secret123
-goippy --add 2508 abc123 ^\+12345
-```
+Parsed fields stored in goippy_state:
+- msisdn
+- gsm_signal
+- gsm_status
+- voip_status
+- voip_state
+- remain_time
+- provider
+- disable_status
+- updated_at  
 
-This creates:
+## XMPP Watchdog
 
-```
-goip_id = goippy_2001
-goip_pass = secret123
-```
+A background thread monitors XMPP every 5 seconds:
 
-Set the same ID/pass in the GoIP SMS Server config.
+- verifies session started
+- verifies TCP connection via send_raw(" ")
+- reconnects automatically
+- reattaches event handlers
+- keeps UDP server running
 
----
+Daemon survives Prosody restarts without downtime.
 
-## GoIP Configuration
+## Log Cleanup
 
-In GoIP web UI:
+LOG_DAYS=N  
+Deletes entries older than N days (hourly).
 
-```
-SMS Server IP:     <your server>
-SMS Server Port:   44444
-ID for SMS:        goippy_<ext>
-Password:          <goip_pass>
-```
+When LOG_DAYS=0  
+→ log cleanup disabled (permanent logs).
 
-Nothing else required — no SMPP, no HTTP.
+## Full Message Flow
 
----
+### Inbound SMS
+GoIP → UDP → goippy → DB log → XMPP message to user
 
-## Prosody XMPP Setup
+### Outbound SMS
+XMPP user → +number@sms.domain → goippy → UDP → GoIP → GSM
 
-goippy connects as an XMPP component, example:
+### USSD
+User → own MSISDN contact → goippy → UDP → GoIP → operator → GoIP → goippy → XMPP reply
 
-```
-Component "data.example.org"
-    component_secret = "YOUR_SECRET"
-```
+### Status / Logs
+User → own MSISDN → command → goippy → DB query → XMPP reply
 
-### Optional helper module: mod_sms_alias
+## Manual Run
 
-Simplifies sending messages to phone numbers.
+Run daemon with explicit config:
+goippy /etc/goippy-2508.conf
 
-Put this file into `/usr/lib/prosody/modules/mod_sms_alias.lua`:
+## Debugging
 
-Enable in the virtual host:
+Restart Prosody in debug:
+prosodyctl restart --debug
 
-```lua
-modules_enabled = { "sms_alias" }
-```
+Check modules:
+- sms_alias
+- component
+- storage_sql  
 
-Now users can send SMS by chatting to:
+ASCII ARCHITECTURE DIAGRAM
 
-```
-+123456789
-```
+              +----------------------+
+              |      Prosody XMPP    |
+              |  (External Component)|
+              +----------+-----------+
+                         ^
+                         | XMPP (component)
+                         |
+                 +-------+--------+
+                 |    goippy     |
+                 |---------------|
+                 | UDP listener  |
+                 | XMPP runner   |
+                 | BOT engine    |
+                 | DB interface  |
+                 +-------+-------+
+                         |
+                         | UDP
+                         v
+               +---------+---------+
+               |      GoIP        |
+               |  GSM Gateway     |
+               +---------+--------+
+                         |
+                         | GSM / SMS / USSD
+                         v
+               +---------+---------+
+               |    Mobile Network |
+               +-------------------+
 
----
+SEQUENCE – Outbound SMS
 
-## USSD Through XMPP
+      User → +372xxxxxxx@sms.domain
+                  |
+                  v
+      Prosody rewrites to sms.domain
+                  |
+                  v
+      goippy.on_message()
+                  |
+                  v
+      UDP: SMS <stamp> 1 <pass> <dest> <text>
+                  |
+                  v
+      GoIP → mobile operator → recipient
 
-Work by contact with phone number of used gateway chanel
+SEQUENCE – Inbound SMS
 
-User from contact with gsm phone number of goip channel sends:
+    GoIP                    goippy                   Prosody/XMPP          User
+    |                        |                           |                 |
+    |-- UDP RECEIVE:msg -->  |                           |                 |
+    |                        |-- log to DB ------------->|                 |
+    |                        |-- send_message ---------->|-- deliver ----->|
 
-```
-*100#
-```
+SEQUENCE – BOT "status"
 
-to:
-
-```
-+123@example.org
-```
-
-goippy converts to GoIP UDP:
-
-```
-USSD <stamp> <goip_pass> *100#
-```
-
-GoIP replies:
-
-```
-USSD <stamp> <text>
-```
-
-goippy forwards to XMPP as a private message:
-
-```
-[USSD] <text>
-```
-
----
+    User        Prosody        goippy             DB
+    |            |              |                |
+    |--status--> |              |                |
+    |            |--rewrite---->|                |
+    |            |              |--query state-->|
+    |            |              |<---row----------|
+    |            |<----reply via XMPP------------|
+    |<-----------|                               |
 
 ## Multiple GoIP devices / many channels
 
