@@ -18,6 +18,13 @@ It provides SMS, USSD, call logging, real-time GoIP state monitoring, bot comman
 - MySQL/MariaDB + SQLite (experimental)
 - Prosody routing via `mod_sms_alias`
 
+---
+Tested on:
+- goip1
+- Firmware Version:	GHSFVT-1.1-68-9
+- Module Version:	M25MAR01A01_RSIM
+- GSM phone number must be seted in goip sim setup
+---
 
 ## Installation
 
