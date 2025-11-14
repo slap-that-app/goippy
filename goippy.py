@@ -20,19 +20,19 @@ Features:
 - If a user sends to their own MSISDN, message is interpreted as USSD.
 
 Admin CLI (run as root typically):
-    goippy.py --sample
-    goippy.py --install           # main instance using /etc/goippy.conf
-    goippy.py --install 2001      # instance goippy-2001.service with /etc/goippy-2001.conf
-    goippy.py --list
-    goippy.py --uninstall 2001
-    goippy.py --add <ext> <pass> [allow_regex]
-    goippy.py --remove <ext>
-    goippy.py --listExt
-    goippy.py --ussd <ext> <code>  # send USSD via GoIP for that extension
+    goippy --sample
+    goippy --install           # main instance using /etc/goippy.conf
+    goippy --install 2001      # instance goippy-2001.service with /etc/goippy-2001.conf
+    goippy --list
+    goippy --uninstall 2001
+    goippy --add <ext> <pass> [allow_regex]
+    goippy --remove <ext>
+    goippy --listExt
+    goippy --ussd <ext> <code>  # send USSD via GoIP for that extension
 
 When run without --flags:
-    goippy.py               -> daemon using /etc/goippy.conf
-    goippy.py /path/config  -> daemon using that config file
+    goippy               -> daemon using /etc/goippy.conf
+    goippy /path/config  -> daemon using that config file
 
 This file is designed to live at: /usr/local/bin/goippy
 """
@@ -52,8 +52,7 @@ import re
 from datetime import datetime
 
 import pymysql   # MariaDB / MySQL
-# SQLite support is wired but kept minimal/experimental.
-import sqlite3
+import sqlite3   # SQLite (optional)
 
 from slixmpp.componentxmpp import ComponentXMPP
 
@@ -64,7 +63,7 @@ from slixmpp.componentxmpp import ComponentXMPP
 CONF_BASE = "/etc/goippy.conf"
 SAMPLE_CONF = "/etc/goippy.conf.sample"
 SYSTEMD_DIR = "/etc/systemd/system"
-SERVICE_DIR = SYSTEMD_DIR   # same, just different name for readability
+SERVICE_DIR = SYSTEMD_DIR   # alias
 
 
 # -------------------------------------------------------------------
@@ -82,10 +81,10 @@ SAMPLE_TEXT = r"""# =============================================
 XMPP_DOMAIN = "example.org"
 
 # Domain used as 'from' for inbound SMS / USSD events
-XMPP_DATA_DOMAIN = "sms.example.org"
+XMPP_DATA_DOMAIN = "data.example.org"
 
 # Component identity (external component in Prosody / ejabberd)
-XMPP_COMPONENT_JID = "sms.example.org"
+XMPP_COMPONENT_JID = "data.example.org"
 XMPP_COMPONENT_SECRET = "replace_me"
 
 # Fallback delivery target when MSISDN has no mapping
@@ -118,6 +117,13 @@ DB_PASS = "replace_me"
 
 # For SQLite (experimental):
 DB_FILE = "/var/lib/goippy/goippy.db"
+
+# -----------------------------
+# Log retention
+# -----------------------------
+# LOG_DAYS = 0  -> keep logs forever
+# LOG_DAYS = N  -> delete goippy_log records older than N days
+LOG_DAYS = 0
 """
 
 
@@ -150,6 +156,7 @@ class DB:
         goippy_gateways(ext, goip_id, goip_pass, channel, msisdn, allow_regex, enabled, created_at)
         goippy_calls(ts, goip_id, ext, direction, remote_num, cause, msisdn, raw, created_at)
         goippy_log(dir, msisdn, xmpp_jid, body, status, created_at)
+        goippy_state(goip_id, ext, msisdn, ... status ..., updated_at)
 
     Supports:
         - MySQL / MariaDB (primary)
@@ -241,8 +248,29 @@ CREATE TABLE IF NOT EXISTS goippy_log (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """)
 
+            # per-goip state from req: keepalive
+            c.execute("""
+CREATE TABLE IF NOT EXISTS goippy_state (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    goip_id VARCHAR(64) UNIQUE,
+    ext VARCHAR(32),
+    msisdn VARCHAR(32),
+    gsm_signal INT,
+    gsm_status VARCHAR(32),
+    voip_status VARCHAR(32),
+    voip_state VARCHAR(64),
+    remain_time INT,
+    provider VARCHAR(64),
+    disable_status TINYINT(1),
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ON UPDATE CURRENT_TIMESTAMP,
+    INDEX(goip_id),
+    INDEX(ext),
+    INDEX(msisdn)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+""")
+
         elif self.backend == "sqlite":
-            # SQLite variant: simpler types, no ENUM, no ENGINE/CHARSET
             c.execute("""
 CREATE TABLE IF NOT EXISTS goippy_gateways (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -279,6 +307,22 @@ CREATE TABLE IF NOT EXISTS goippy_log (
     body TEXT,
     status TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+""")
+            c.execute("""
+CREATE TABLE IF NOT EXISTS goippy_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goip_id TEXT UNIQUE,
+    ext TEXT,
+    msisdn TEXT,
+    gsm_signal INTEGER,
+    gsm_status TEXT,
+    voip_status TEXT,
+    voip_state TEXT,
+    remain_time INTEGER,
+    provider TEXT,
+    disable_status INTEGER,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 """)
             self.conn.commit()
@@ -332,12 +376,8 @@ ON DUPLICATE KEY UPDATE
 
     def list_gateways(self):
         c = self.cursor()
-        if self.backend == "mysql":
-            c.execute("SELECT * FROM goippy_gateways ORDER BY ext")
-        else:
-            c.execute("SELECT * FROM goippy_gateways ORDER BY ext")
+        c.execute("SELECT * FROM goippy_gateways ORDER BY ext")
         rows = c.fetchall()
-        # Normalize keys to dict for sqlite Row
         return [dict(r) for r in rows]
 
     def find_gateway_by_goip_id(self, goip_id, goip_pass=None):
@@ -432,31 +472,110 @@ VALUES(?,?,?,?,?,?,?,?)
 
     def auth_ok(self, goip_id, goip_pass):
         c = self.cursor()
-        q = "SELECT 1 FROM goippy_gateways WHERE goip_id=? AND goip_pass=? AND enabled=1" if self.backend=="sqlite" \
-            else "SELECT 1 FROM goippy_gateways WHERE goip_id=%s AND goip_pass=%s AND enabled=1"
+        if self.backend == "sqlite":
+            q = "SELECT 1 FROM goippy_gateways WHERE goip_id=? AND goip_pass=? AND enabled=1"
+        else:
+            q = "SELECT 1 FROM goippy_gateways WHERE goip_id=%s AND goip_pass=%s AND enabled=1"
         c.execute(q, (goip_id, goip_pass))
-        return c.fetchone is not None
+        row = c.fetchone()
+        return row is not None
+
+    # -----------------------------
+    # State table helpers
+    # -----------------------------
+    def update_state(self, goip_id, ext, msisdn, kv):
+        """
+        Store parsed req: keepalive data into goippy_state.
+        """
+        c = self.cursor()
+        def _int(key, default=0):
+            try:
+                return int(kv.get(key, default))
+            except Exception:
+                return default
+
+        gsm_signal = _int("signal", 0)
+        gsm_status = kv.get("gsm_status")
+        voip_status = kv.get("voip_status")
+        voip_state = kv.get("voip_state")
+        remain_time = _int("remain_time", -1)
+        provider = kv.get("pro")
+        disable_status = _int("disable_status", 0)
+
+        if self.backend == "mysql":
+            c.execute("""
+INSERT INTO goippy_state(goip_id, ext, msisdn, gsm_signal, gsm_status,
+                        voip_status, voip_state, remain_time, provider,
+                        disable_status)
+VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+ON DUPLICATE KEY UPDATE
+  ext=VALUES(ext),
+  msisdn=VALUES(msisdn),
+  gsm_signal=VALUES(gsm_signal),
+  gsm_status=VALUES(gsm_status),
+  voip_status=VALUES(voip_status),
+  voip_state=VALUES(voip_state),
+  remain_time=VALUES(remain_time),
+  provider=VALUES(provider),
+  disable_status=VALUES(disable_status),
+  updated_at=CURRENT_TIMESTAMP
+""", (goip_id, ext, msisdn, gsm_signal, gsm_status, voip_status,
+      voip_state, remain_time, provider, disable_status))
+        else:
+            # SQLite: simple delete+insert
+            c.execute("DELETE FROM goippy_state WHERE goip_id=?", (goip_id,))
+            c.execute("""
+INSERT INTO goippy_state(goip_id, ext, msisdn, gsm_signal, gsm_status,
+                        voip_status, voip_state, remain_time, provider,
+                        disable_status)
+VALUES(?,?,?,?,?,?,?,?,?,?)
+""", (goip_id, ext, msisdn, gsm_signal, gsm_status, voip_status,
+      voip_state, remain_time, provider, disable_status))
+            self.conn.commit()
+
+    def fetch_state(self, ext):
+        c = self.cursor()
+        if self.backend == "mysql":
+            c.execute("SELECT * FROM goippy_state WHERE ext=%s LIMIT 1", (ext,))
+        else:
+            c.execute("SELECT * FROM goippy_state WHERE ext=? LIMIT 1", (ext,))
+        row = c.fetchone()
+        return dict(row) if row else None
+
+    def fetch_call_log(self, ext, limit=None):
+        c = self.cursor()
+        if limit:
+            sql = "SELECT * FROM goippy_calls WHERE ext=%s ORDER BY id DESC LIMIT %s"
+            params = (ext, limit)
+        else:
+            sql = "SELECT * FROM goippy_calls WHERE ext=%s ORDER BY id DESC"
+            params = (ext,)
+        if self.backend == "sqlite":
+            sql = sql.replace("%s", "?")
+        c.execute(sql, params)
+        return [dict(r) for r in c.fetchall()]
 
     def purge_old_logs(self, days):
-        """Delete logs older than <days> days. days=0 → do nothing."""
+        """
+        Delete rows from goippy_log older than <days> days.
+        days <= 0 -> do nothing.
+        """
         if not days or days <= 0:
             return
-
-        self.connect()
-
-        if self.kind == "sqlite":
-            sql = """
-                DELETE FROM goippy_log
-                WHERE created_at < datetime('now', ?)
-            """
-            # Example: days=3 → '-3 days'
-            self._exec(sql, (f"-{days} days",))
+        c = self.cursor()
+        if self.backend == "mysql":
+            c.execute(
+                "DELETE FROM goippy_log WHERE created_at < (NOW() - INTERVAL %s DAY)",
+                (days,),
+            )
         else:
-            sql = """
-                DELETE FROM goippy_log
-                WHERE created_at < (NOW() - INTERVAL %s DAY)
-            """
-            self._exec(sql, (days,))
+            # SQLite: created_at is TEXT, stored as CURRENT_TIMESTAMP
+            c.execute(
+                "DELETE FROM goippy_log WHERE created_at < datetime('now', ?)",
+                (f"-{days} days",),
+            )
+            self.conn.commit()
+
 
 # -------------------------------------------------------------------
 # GoIP UDP server
@@ -466,7 +585,7 @@ class GoIPServer(threading.Thread):
     """
     Handles all UDP traffic with GoIP:
 
-    - req:...            -> heartbeat/state, we reply "resp:<reqid>;id:<goip_id>;status:0;"
+    - req:...            -> heartbeat/state, we reply "reg:<reqid>;status:200;"
     - RECEIVE:...        -> inbound SMS
     - USSD/USSN:...      -> USSD responses
     - RECORD:/HANGUP:... -> call events
@@ -541,7 +660,6 @@ class GoIPServer(threading.Thread):
 
         stamp = int(time.time())
         # SMS <stamp> <chan> <password> <dest> <message>
-        # Channel (1) is often ignored in "SMS Server" mode; hardware decides.
         payload = f"SMS {stamp} 1 {goip_pass} {dest} {text}"
         self.log(f"Sending SMS via {goip_id} to {dest}: {text!r} -> {payload}")
         self.sock.sendto(payload.encode("utf-8"), addr)
@@ -610,7 +728,7 @@ class GoIPServer(threading.Thread):
 
             loop = getattr(self.xmpp, "loop", None)
             if loop and loop.is_running():
-                self.log(f"XMPP message to: {to_jid} from: {from_jid} ---------------------------")
+                self.log(f"XMPP message to: {to_jid} from: {from_jid}")
                 loop.call_soon_threadsafe(
                     lambda: self.xmpp.send_message(
                         mto=to_jid,
@@ -694,24 +812,31 @@ class GoIPServer(threading.Thread):
 
                     if not self.db.auth_ok(goip_id, goip_pass):
                         reply = f"reg:{reqid};status:403;"
-                        self.transport.sendto(reply.encode(), addr)
-                        log(self.c, f"[GoIP] Heartbeat DENY -> {reply}")
+                        self.sock.sendto(reply.encode("utf-8"), addr)
+                        self.log(f"Heartbeat DENY -> {reply}")
                         continue
 
                     # remember source address
                     self.last_addr_for[goip_id] = addr
 
-                    # Always ACK to keep hardware happy
-                    #reply = f"resp:{reqid};id:{goip_id};status:0;"
+                    # ACK GoIP (this format keeps SMS_LOGIN:Y happy)
                     reply = f"reg:{reqid};status:200;"
                     self.sock.sendto(reply.encode("utf-8"), addr)
                     self.log(f"Heartbeat ACK -> {reply}")
 
-                    # Try to update MSISDN mapping
+                    # Update MSISDN mapping
                     try:
                         self.db.update_gateway_msisdn(goip_id, num)
                     except Exception as e:
                         self.log("Error updating gateway msisdn:", e)
+
+                    # Update extended state row
+                    try:
+                        gw = self.db.find_gateway_by_goip_id(goip_id)
+                        ext = gw["ext"] if gw else None
+                        self.db.update_state(goip_id, ext, num, kv)
+                    except Exception as e:
+                        self.log("Error updating state:", e)
 
                     continue
 
@@ -762,19 +887,14 @@ class GoIPServer(threading.Thread):
 
                 # --------------------------------------------------
                 # Format B: "USSD <stamp> <text...>"
-                # e.g. "USSD 1763001996 Your balance is..."
                 # --------------------------------------------------
                 if msg.startswith("USSD "):
                     parts = msg.split(" ", 2)
                     if len(parts) >= 3:
-                        # parts[0] == "USSD"
-                        # parts[1] == <stamp>
                         text = parts[2]
                     else:
                         text = msg[5:]
 
-                    # Need to detect which GoIP channel this came from
-                    # We use reverse lookup by source IP:port -> goip_id
                     goip_id = None
                     for gid, a in self.last_addr_for.items():
                         if a == addr:
@@ -790,8 +910,6 @@ class GoIPServer(threading.Thread):
 
                 # -----------------------------
                 # Call records
-                # RECORD:ts;id:...;password:...;dir:2;num:+123...
-                # HANGUP:ts;id:...;password:...;num:+123...,cause:1,0
                 # -----------------------------
                 if msg.startswith("RECORD:") or msg.startswith("HANGUP:"):
                     kv = self._parse_kv(msg)
@@ -856,29 +974,6 @@ class GoIPServer(threading.Thread):
 
         self.log("UDP listener exiting.")
 
-    def _handle_req(self, msg, addr):
-        # req:<id>;id:<goip_id>;pass:<pass>;num:<msisdn>;...;SMS_LOGIN:[Y|N];
-        m = re.search(r"req:(\d+);id:([^;]+);pass:([^;]+);", msg)
-        if not m:
-            log(self.c, "[GoIP] Malformed 'req:'")
-            return
-        reqid, goip_id, goip_pass = m.groups()
-
-        if not self.db.auth_ok(goip_id, goip_pass):
-            reply = f"reg:{reqid};status:403;"
-            self.transport.sendto(reply.encode(), addr)
-            log(self.c, f"[GoIP] Heartbeat DENY -> {reply}")
-            return
-
-        # Store msisdn & last addr
-        num = self._kv(msg).get("num") or ""
-        if num:
-            self.db.update_msisdn(goip_id, num)
-        self.last_addr[goip_id] = addr
-
-        reply = f"reg:{reqid};status:200;"
-        self.transport.sendto(reply.encode(), addr)
-        log(self.c, f"[GoIP] Heartbeat ACK -> {reply}")
 
 # -------------------------------------------------------------------
 # XMPP Component
@@ -896,6 +991,11 @@ class GoippyXMPP(ComponentXMPP):
 
     - Inbound SMS/USSD from GoIP is delivered via GoIPServer calling
       db + xmpp.send_message() with from=msisdn@XMPP_DATA_DOMAIN
+
+    Extra bot commands (per ext):
+      body == "status"       -> reply with last radio state from goippy_state
+      body == "log" / "log 0" -> dump full call log for that ext
+      body == "log N"        -> last N call records
     """
 
     def __init__(self, conf, db, goip_server):
@@ -908,11 +1008,13 @@ class GoippyXMPP(ComponentXMPP):
         self.c = conf
         self.db = db
         self.goip = goip_server
+        self.session_started = False
 
         self.add_event_handler("session_start", self.on_session_start)
         self.add_event_handler("message", self.on_message)
 
     async def on_session_start(self, _):
+        self.session_started = True
         print(f"[goippy] XMPP component connected as {self.c['XMPP_COMPONENT_JID']}")
 
     def on_message(self, m):
@@ -929,11 +1031,79 @@ class GoippyXMPP(ComponentXMPP):
         ext = from_bare.split("@", 1)[0]
         dest_local = to_bare.split("@", 1)[0]
 
+        body_l = body.lower()
+
+        # ----------------------------------------
+        # BOT COMMANDS: status / log
+        # ----------------------------------------
+        if body_l.startswith("status"):
+            st = self.db.fetch_state(ext)
+            if not st:
+                self.send_message(
+                    mto=from_bare,
+                    mbody="No state available yet (no req: seen).",
+                    mtype="chat",
+                )
+            else:
+                text = (
+                    f"State for {st.get('msisdn') or 'unknown'}:\n"
+                    f"  Signal: {st.get('gsm_signal')}\n"
+                    f"  GSM: {st.get('gsm_status')}\n"
+                    f"  VOIP: {st.get('voip_status')} / {st.get('voip_state')}\n"
+                    f"  Provider: {st.get('provider')}\n"
+                    f"  Disabled: {st.get('disable_status')}\n"
+                    f"  Updated: {st.get('updated_at')}"
+                )
+                self.send_message(mto=from_bare, mbody=text, mtype="chat")
+            return
+
+        if body_l.startswith("log"):
+            parts = body_l.split()
+            limit = None
+            if len(parts) > 1:
+                try:
+                    n = int(parts[1])
+                    limit = None if n <= 0 else n
+                except Exception:
+                    limit = None
+
+            rows = self.db.fetch_call_log(ext, limit)
+            if not rows:
+                self.send_message(
+                    mto=from_bare,
+                    mbody="No call log entries.",
+                    mtype="chat",
+                )
+                return
+
+            lines = ["Call log:"]
+            for r in rows:
+                ts = r.get("ts")
+                try:
+                    ts_str = datetime.fromtimestamp(ts).isoformat(sep=" ") if ts else "n/a"
+                except Exception:
+                    ts_str = str(ts or "n/a")
+                lines.append(
+                    f"{r.get('id')}: {ts_str} num={r.get('remote_num')} "
+                    f"dir={r.get('direction')} cause={r.get('cause')}"
+                )
+
+            self.send_message(
+                mto=from_bare,
+                mbody="\n".join(lines),
+                mtype="chat",
+            )
+            return
+
+        # ----------------------------------------
+        # SMS / USSD routing
+        # ----------------------------------------
+
         # Destination must look like a phone number (+ or digits)
         if not re.match(r"^\+?\d+$", dest_local):
             self.send_message(
                 mto=from_bare,
-                mbody="Destination must be a phone number (+123...)",
+                mbody="Destination must be a phone number (+123...).",
                 mtype="chat",
             )
             return
@@ -948,7 +1118,7 @@ class GoippyXMPP(ComponentXMPP):
             )
             return
 
-        # Normalize: +removed for comparison
+        # Normalize: + removed for comparison
         def normalize_num(x):
             return (x or "").replace("+", "").replace(" ", "")
 
@@ -982,6 +1152,22 @@ class GoippyXMPP(ComponentXMPP):
                 mbody=f"Error: {e}",
                 mtype="chat",
             )
+
+    def is_alive(self):
+        """
+        Minimal liveness check:
+        - session started?
+        - connected transport?
+        """
+        try:
+            if not getattr(self, "session_started", False):
+                return False
+            if not self.connected:
+                return False
+            return True
+        except Exception:
+            return False
+
 
 # -------------------------------------------------------------------
 # Systemd unit writer
@@ -1111,14 +1297,13 @@ def uninstall_instance(suffix):
 
 
 def gateways_cli_add(args):
-    if len(args) < 3:
-        print("Usage: goippy --add <ext> <goip_pass> <channel(optional or '-')> [allow_regex]")
+    if len(args) < 2:
+        print("Usage: goippy --add <ext> <goip_pass> [allow_regex]")
         sys.exit(1)
 
     ext = args[0]
     goip_pass = args[1]
-    channel = args[2]
-    allow_regex = args[3] if len(args) > 3 else ".*"
+    allow_regex = args[2] if len(args) > 2 else ".*"
 
     base_conf = load_conf(CONF_BASE)
     db = DB(base_conf)
@@ -1183,24 +1368,18 @@ def cli_ussd(args):
     db.connect()
     db.ensure_tables()
 
-    # We need a minimal GoIPServer just to reuse send_ussd.
-    # It will not start the listener thread; we just create a socket
-    # and a fake last_addr_for entry AFTER the first req: has happened
-    # in a running daemon. So this is mostly useful if daemon already ran.
     print("[goippy] NOTE: cli --ussd assumes a running daemon has already learned GoIP address.")
-
-    # Minimal stub: open socket + use last_addr from table? We don't persist that.
-    # So for now: simply print guidance.
     print(
         "[goippy] For simple USSD testing, send USSD by chatting in XMPP:\n"
         "  From ext@example.org to its own MSISDN contact, send the USSD code.\n"
         "The running goippy daemon will convert that to UDP USSD."
     )
 
+
 def start_log_purger(conf, db):
-    days = int(conf.get("LOG_DAYS", 0))
+    days = int(conf.get("LOG_DAYS", 0) or 0)
     if days <= 0:
-        return  # Disabled
+        return None
 
     def worker():
         while True:
@@ -1214,6 +1393,28 @@ def start_log_purger(conf, db):
     t.start()
     return t
 
+# -------------------------------------------------------------------
+# XMPP launcher (modern slixmpp async API)
+# -------------------------------------------------------------------
+
+async def xmpp_runner(xmpp, stop_flag):
+    """
+    Keeps XMPP online forever.
+    Reconnects automatically on disconnect or error.
+    """
+    while not stop_flag["stopping"]:
+        try:
+            print("[goippy] Connecting XMPP component...")
+            await xmpp.connect()        # slixmpp async connect()
+            await xmpp.process()        # slixmpp async event loop
+        except Exception as e:
+            print("[goippy] XMPP error:", e)
+
+        if stop_flag["stopping"]:
+            break
+
+        print("[goippy] XMPP disconnected — retry in 5s...")
+        await asyncio.sleep(5)
 # -------------------------------------------------------------------
 # Daemon main runner
 # -------------------------------------------------------------------
@@ -1237,10 +1438,9 @@ def run_daemon(conf_path):
     # Start UDP listener thread
     goip_server.start()
 
-    # NEW: start log cleanup worker
+    # Start log cleanup worker
     start_log_purger(c, db)
 
-    # Flag for graceful shutdown
     stop_flag = {"stopping": False}
 
     def shutdown(signum, frame):
@@ -1259,42 +1459,39 @@ def run_daemon(conf_path):
         except:
             pass
 
-        try:
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(loop.stop)
-        except:
-            pass
-
-    # Register signal handlers
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    # ----------------------------------------------------
-    # XMPP CONNECT + MAIN LOOP (this keeps daemon alive)
-    # ----------------------------------------------------
-    loop = asyncio.get_event_loop()
+    # XMPP reconnect loop lives in main thread
+    while not stop_flag["stopping"]:
+        try:
+            xmpp.session_started = False
+            print("[goippy] Connecting XMPP component...")
+            xmpp.connect()
+            # slixmpp manages its own asyncio loop internally
+            xmpp.process(forever=False)
+            print("[goippy] XMPP process() returned.")
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print("[goippy] XMPP error:", e)
 
-    # Connect component to XMPP server
-    loop.run_until_complete(xmpp.connect())
+        if not stop_flag["stopping"]:
+            print("[goippy] XMPP disconnected — retry in 5s...")
+            time.sleep(5)
 
-    # Wait for session_start
-    loop.create_task(xmpp.wait_until('session_start'))
+    print("[goippy] daemon stopping...")
 
-    # Block here until shutdown()
     try:
-        loop.run_forever()
-    finally:
-        # safety cleanup
-        try:
-            goip_server.stop()
-        except:
-            pass
-        try:
-            xmpp.disconnect()
-        except:
-            pass
+        goip_server.stop()
+    except:
+        pass
+    try:
+        xmpp.disconnect()
+    except:
+        pass
 
-        print("[goippy] daemon stopped.")
+    print("[goippy] daemon stopped.")
 
 
 # -------------------------------------------------------------------
@@ -1347,7 +1544,7 @@ def main():
         print("  --install [suffix]")
         print("  --uninstall <suffix-or-default>")
         print("  --list")
-        print("  --add <ext> <goip_pass> <channel(optional)> [allow_regex]")
+        print("  --add <ext> <goip_pass> [allow_regex]")
         print("  --remove <ext>")
         print("  --listExt")
         print("  --ussd <ext> <code>")

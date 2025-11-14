@@ -5,7 +5,7 @@ goippy communicates with GoIP devices using their SMS-Server UDP API
 (`req:…`, `RECEIVE:…`, `USSD …`, `RECORD:…`, `HANGUP:…`)  
 and exposes SMS/USSD to XMPP through an external component (Prosody, ejabberd).
 
-All configuration and history are stored in MariaDB/MySQL or SQLite.
+Use MariaDB/MySQL or SQLite.
 
 
 ---
