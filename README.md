@@ -80,7 +80,7 @@ modules_enabled = {
 
 ---
 
-# ✅ **README.md – SMS Alias Routing (mod_sms_alias.lua)**
+# ✅ **SMS Alias Routing (mod_sms_alias.lua)**
 
 Outgoing SMS messages are sent to phone-like JIDs:
 
@@ -114,7 +114,7 @@ modules_enabled = {
 }
 ```
 
-# ✅ **README.md – SMS Alias Routing (mod_sms_alias.lua)**
+# ✅ **SMS Alias Routing (mod_sms_alias.lua)**
 
 Outgoing SMS messages are sent to phone-like JIDs:
 
