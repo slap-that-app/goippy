@@ -114,40 +114,6 @@ modules_enabled = {
 }
 ```
 
-# ✅ **SMS Alias Routing (mod_sms_alias.lua)**
-
-Outgoing SMS messages are sent to phone-like JIDs:
-
-```
-<message to="+37255512345@domain.example">
-```
-
-A Prosody module rewrites them:
-
-```
-+37255512345@domain.example
-    → +37255512345@data.domain.example
-```
-
-where `data.domain.example` is your goippy component.
-
-This ensures:
-
-- local users never collide with phone-number JIDs
-- messages always reach goippy
-- inbound/outbound traffic remains cleanly separated
-
-Example Prosody config:
-
-```lua
-Component "data.domain.example" "component"
-    component_secret = "yoursecret"
-
-modules_enabled = {
-    "sms_alias";   -- the routing filter
-}
-```
-
 ## Database Schema
 
 ### goippy_gateways
